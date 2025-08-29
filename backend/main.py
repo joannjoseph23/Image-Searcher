@@ -1,157 +1,172 @@
-import os, io, json, base64, uuid
-from typing import List
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from sqlalchemy import text
-from sqlalchemy.orm import Session
-import fitz      # PyMuPDF
-from PIL import Image
+import base64
+import hashlib
+import io
+import os
+from pathlib import Path
+from typing import Iterable, Tuple
+
+import fitz  # PyMuPDF
 from dotenv import load_dotenv
+from fastapi import FastAPI
 from openai import OpenAI
+from PIL import Image
 
-from db import get_db
+from db import init_db, session_scope, upsert_image_page
 
-load_dotenv()
-
+load_dotenv()  # loads .env in backend/
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY missing")
+    raise RuntimeError("OPENAI_API_KEY missing in .env")
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-OPENAI_MODEL_VISION = os.getenv("OPENAI_MODEL_VISION", "gpt-4o")
-OPENAI_MODEL_EMBED  = os.getenv("OPENAI_MODEL_EMBED", "text-embedding-3-small")
-RENDER_DPI = int(os.getenv("RENDER_DPI", "300"))
+app = FastAPI(title="IMG Searcher Backend")
 
-SCHEMA_PROMPT = open("schema_prompt.txt", "r", encoding="utf-8").read()
+# ---------- Helpers ----------
 
-app = FastAPI(title="Image Searcher Backend")
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-# CORS for your Next.js dev server
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class IngestResponse(BaseModel):
-    file_id: str
-    pages_indexed: int
-
-def bytes_to_data_url_png(png_bytes: bytes) -> str:
-    b64 = base64.b64encode(png_bytes).decode("utf-8")
-    return "data:image/png;base64," + b64
-
-def rasterize_pdf(pdf_bytes: bytes, dpi: int):
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    for i, page in enumerate(doc):
+def render_pdf_pages(pdf_path: Path, dpi: int = 150) -> Iterable[Tuple[int, bytes, Tuple[int, int]]]:
+    """
+    Yields (page_number, png_bytes, (width,height)) for each page.
+    """
+    doc = fitz.open(pdf_path)
+    for i, page in enumerate(doc, start=1):
+        mat = fitz.Matrix(dpi/72, dpi/72)  # scale
         pix = page.get_pixmap(matrix=mat, alpha=False)
-        yield (i+1, pix.tobytes("png"), pix.width, pix.height)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        yield i, buf.getvalue(), (pix.width, pix.height)
 
-def extract_features(png_bytes: bytes) -> dict:
-    r = client.chat.completions.create(
-        model=OPENAI_MODEL_VISION,
-        temperature=0,
+def png_bytes_to_data_url(png_bytes: bytes) -> str:
+    b64 = base64.b64encode(png_bytes).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+def call_openai_vision(png_bytes: bytes) -> dict:
+    """
+    Ask for structured JSON describing the image.
+    """
+    data_url = png_bytes_to_data_url(png_bytes)
+    SYSTEM = "You are an image metadata extractor. Return concise JSON only."
+    USER = (
+        "Extract this schema:\n"
+        "{\n"
+        '  "caption": "string (<= 15 words)",\n'
+        '  "keywords": ["string", "..."],\n'
+        '  "objects": [{"name": "string", "confidence": 0..1}],\n'
+        '  "colors": ["string"],\n'
+        '  "is_eyewear_present": boolean\n'
+        "}\n"
+        "Be accurate and avoid speculation."
+    )
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
         response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": SCHEMA_PROMPT},
-            {"role": "user", "content": [
-                {"type": "input_text", "text": "Index this page image per the schema."},
-                {"type": "input_image", "image_url": bytes_to_data_url_png(png_bytes)}
-            ]}
-        ]
+            {"role": "system", "content": SYSTEM},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": USER},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
+        temperature=0.2,
     )
-    return json.loads(r.choices[0].message.content)
+    import json
+    return json.loads(resp.choices[0].message.content)
 
-def build_embed_text(feats: dict) -> str:
-    colors = (feats.get("colors") or {})
-    chart = (feats.get("chart") or {})
-    text = (feats.get("text") or {})
-    parts = [
-        feats.get("caption",""),
-        "types: " + " ".join(feats.get("content_types", [])),
-        "colors: " + " ".join(colors.get("color_names", [])),
-        "chart: " + (chart.get("type") or "none") + " topics " + " ".join(chart.get("topic_keywords", [])),
-        "text: " + (text.get("summary") or "")
-    ]
-    return ". ".join(p for p in parts if p)
+def embed_text(text: str) -> list[float]:
+    emb = client.embeddings.create(model="text-embedding-3-large", input=text)
+    return emb.data[0].embedding
 
-def embed(text_str: str) -> List[float]:
-    e = client.embeddings.create(model=OPENAI_MODEL_EMBED, input=text_str)
-    return e.data[0].embedding
+def build_text_for_embedding(meta: dict, fallback_filename: str) -> str:
+    caption = meta.get("caption") or ""
+    keywords = meta.get("keywords") or []
+    objects = [o.get("name", "") for o in meta.get("objects", [])]
+    colors = meta.get("colors") or []
+    eyewear = "eyewear_present" if meta.get("is_eyewear_present") else ""
+    return "\n".join(
+        [
+            fallback_filename,
+            caption,
+            " ".join(keywords),
+            " ".join(objects),
+            " ".join(colors),
+            eyewear,
+        ]
+    ).strip()
+
+# ---------- Core pipeline ----------
+
+def process_pdf(pdf_path: Path, web_path_for_ui: str | None = None):
+    sha = file_sha256(pdf_path)
+    pdf_filename = pdf_path.name
+    web_path = web_path_for_ui or f"/samples/{pdf_filename}"
+
+    for page_number, png_bytes, (w, h) in render_pdf_pages(pdf_path):
+        meta = call_openai_vision(png_bytes)
+
+        text_for_embedding = build_text_for_embedding(meta, fallback_filename=pdf_filename)
+        vector = embed_text(text_for_embedding)
+
+        row_id = f"{sha}-p{page_number}"
+        with session_scope() as s:
+            upsert_image_page(
+                s,
+                id=row_id,
+                pdf_filename=pdf_filename,
+                pdf_path=web_path,
+                page_number=page_number,
+                width=w,
+                height=h,
+                size_bytes=len(png_bytes),
+                caption=meta.get("caption"),
+                keywords=meta.get("keywords"),
+                raw_metadata=meta,
+                embedding=vector,
+            )
+        print(f"✓ Stored {pdf_filename} page {page_number}")
+
+# ---------- API ----------
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
-@app.post("/ingest", response_model=IngestResponse)
-async def ingest(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="Only PDFs are supported.")
+@app.post("/ingest/local")
+def ingest_local(folder: str = "../frontend/public/samples"):
+    """
+    Process all PDFs in a local folder (default points to your dev samples).
+    """
+    folder_path = Path(folder).resolve()
+    if not folder_path.exists():
+        return {"ok": False, "error": f"Folder not found: {folder_path}"}
 
-    pdf_bytes = await file.read()
+    pdfs = sorted(folder_path.glob("*.pdf"))
+    if not pdfs:
+        return {"ok": False, "error": f"No PDFs in {folder_path}"}
 
-    # Insert file row
-    file_id = str(uuid.uuid4())
-    db.execute(text("""
-        INSERT INTO files (id, original_name, mime_type, bytes_size)
-        VALUES (:id, :name, :mime, :size)
-    """), {"id": file_id, "name": file.filename, "mime": file.content_type, "size": len(pdf_bytes)})
-    db.commit()
+    for pdf in pdfs:
+        # When serving via Next.js public/, this web path works in your UI
+        web_path = f"/samples/{pdf.name}"
+        process_pdf(pdf, web_path_for_ui=web_path)
 
-    pages_indexed = 0
-    for page_no, png_bytes, w, h in rasterize_pdf(pdf_bytes, RENDER_DPI):
-        # OpenAI features (full-res)
-        feats = extract_features(png_bytes)
-        # Embedding string
-        emb_text = build_embed_text(feats)
-        vec = embed(emb_text)
+    return {"ok": True, "processed": len(pdfs)}
 
-        colors = feats.get("colors") or {}
-        chart  = feats.get("chart") or {}
-        textf  = feats.get("text") or {}
-        kf     = textf.get("key_fields") or {}
+# ---------- CLI ----------
 
-        db.execute(text("""
-        INSERT INTO pages (
-            file_id, page_number, width, height,
-            caption, content_types, has_chart, chart_type, chart_topics,
-            color_names, colors_hex, primary_background,
-            text_summary, key_brand, key_product, key_variant, claims,
-            metadata, embedding
-        ) VALUES (
-            :file_id, :page_number, :w, :h,
-            :caption, :content_types, :has_chart, :chart_type, :chart_topics,
-            :color_names, :colors_hex, :primary_background,
-            :text_summary, :key_brand, :key_product, :key_variant, :claims,
-            :metadata, :embedding
-        )
-        """),
-        {
-            "file_id": file_id,
-            "page_number": page_no,
-            "w": w, "h": h,
-            "caption": feats.get("caption",""),
-            "content_types": feats.get("content_types", []),
-            "has_chart": bool(chart.get("has_chart", False)),
-            "chart_type": chart.get("type") or "",
-            "chart_topics": chart.get("topic_keywords", []),
-            "color_names": colors.get("color_names", []),
-            "colors_hex": colors.get("dominant_hex", []),
-            "primary_background": colors.get("primary_background"),
-            "text_summary": textf.get("summary",""),
-            "key_brand": (kf.get("brand") or ""),
-            "key_product": (kf.get("product") or ""),
-            "key_variant": (kf.get("variant") or ""),
-            "claims": (kf.get("claims") or []),
-            "metadata": json.dumps(feats, ensure_ascii=False),
-            "embedding": vec
-        })
-        pages_indexed += 1
-
-    db.commit()
-    return IngestResponse(file_id=file_id, pages_indexed=pages_indexed)
+if __name__ == "__main__":
+    init_db()
+    # Run as a one-off to ingest your dev PDFs:
+    samples = Path(__file__).resolve().parents[1] / "frontend" / "public" / "samples"
+    print(f"Ingesting from: {samples}")
+    for p in sorted(samples.glob("*.pdf")):
+        process_pdf(p, web_path_for_ui=f"/samples/{p.name}")
