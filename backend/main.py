@@ -153,9 +153,54 @@ async def upload(file: UploadFile = File(...)):
     process_pdf(target, web_path_for_ui=f"/samples/{file.filename}")
 
     return {"ok": True, "file": file.filename, "web_path": f"/samples/{file.filename}"}
+@app.post("/admin/cleanup-missing")
+def cleanup_missing():
+    removed: list[str] = []
+    with session_scope() as s:
+        rows = s.execute(text("SELECT DISTINCT pdf_filename, pdf_path FROM image_pages")).all()
+        for fn, web_path in rows:
+            fs_path = SAMPLES_DIR / Path(web_path).name
+            if not fs_path.exists():
+                s.execute(text("DELETE FROM image_pages WHERE pdf_filename = :fn"), {"fn": fn})
+                removed.append(fn)
+        s.commit()
+    return {"ok": True, "removed": removed}
 @app.get("/health")
 def health():
     return {"ok": True}
+@app.get("/debug/db")
+def debug_db():
+    # Count rows + return a few examples so you know it's connected
+    with session_scope() as s:
+        count = s.execute(text("SELECT count(*) FROM image_pages")).scalar_one()
+        rows = s.execute(
+            text("""
+                SELECT id, pdf_filename, page_number, caption, keywords, pdf_path
+                FROM image_pages
+                ORDER BY id DESC
+                LIMIT 10
+            """)
+        ).mappings().all()
+    return {"ok": True, "count": count, "sample": [dict(r) for r in rows]}
+@app.get("/items")
+def items():
+    with session_scope() as s:
+        rows = s.execute(text("""
+            SELECT id, pdf_filename, page_number, caption, keywords, pdf_path
+            FROM image_pages
+            ORDER BY pdf_filename, page_number
+        """)).mappings().all()
+
+    def exists(r):
+        p = SAMPLES_DIR / Path(r["pdf_path"]).name
+        return p.exists()
+
+    return {"ok": True, "items": [dict(r) for r in rows if exists(r)]}
+
+@app.post("/ingest/scan")
+def ingest_scan(folder: str = "../frontend/public/samples"):
+    # same as /ingest/local – it will upsert and skip existing pages
+    return ingest_local(folder)
 
 @app.post("/ingest/local")
 def ingest_local(folder: str = "../frontend/public/samples"):

@@ -1,13 +1,13 @@
 "use client";
 
 import { ImageIcon, Upload, X } from "lucide-react";
-import type React from "react";
-import { useCallback, useState } from "react";
-
+import React, { useCallback, useState } from "react";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "./ui/card";
 import { Progress } from "./ui/progress";
+
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8001";
 
 interface UploadFile {
   id: string;
@@ -17,7 +17,7 @@ interface UploadFile {
   preview?: string; // data URL of PDF first page
 }
 
-/** Lazy loader for pdf.js (avoids SSR crash) */
+/** pdf.js lazy loader (client-only) */
 let pdfjsPromise: Promise<typeof import("pdfjs-dist/build/pdf")> | null = null;
 async function getPdfjs() {
   if (!pdfjsPromise) pdfjsPromise = import("pdfjs-dist/build/pdf");
@@ -49,14 +49,17 @@ export function UploadPage() {
     const arrayBuffer = await file.arrayBuffer();
     const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
     const page = await pdf.getPage(1);
+
     const desiredWidth = 160;
     const viewport = page.getViewport({ scale: 1 });
     const scale = desiredWidth / viewport.width;
     const scaledViewport = page.getViewport({ scale });
+
     const canvas = document.createElement("canvas");
     const ctx = canvas.getContext("2d")!;
     canvas.width = Math.ceil(scaledViewport.width);
     canvas.height = Math.ceil(scaledViewport.height);
+
     await page.render({ canvasContext: ctx, viewport: scaledViewport, canvas }).promise;
     return canvas.toDataURL("image/png");
   };
@@ -82,30 +85,65 @@ export function UploadPage() {
     setUploadFiles((prev) => [...prev, ...newFiles]);
   }, []);
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragOver(false);
-    handleFiles(e.dataTransfer.files);
-  }, [handleFiles]);
+  const handleDrop = useCallback(
+    (e: React.DragEvent) => {
+      e.preventDefault();
+      setIsDragOver(false);
+      handleFiles(e.dataTransfer.files);
+    },
+    [handleFiles]
+  );
 
-  const handleFileInput = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) handleFiles(e.target.files);
-  }, [handleFiles]);
+  const handleFileInput = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      if (e.target.files) handleFiles(e.target.files);
+    },
+    [handleFiles]
+  );
 
   /** ---- real upload to backend ---- */
   const uploadOne = async (fileRec: UploadFile) => {
-    setUploadFiles((prev) => prev.map(f => f.id === fileRec.id ? { ...f, status: "uploading", progress: 5 } : f));
-    const form = new FormData();
-    form.append("file", fileRec.file);
+    setUploadFiles((prev) =>
+      prev.map((f) => (f.id === fileRec.id ? { ...f, status: "uploading", progress: 5 } : f))
+    );
+
     try {
-      const r = await fetch(`${process.env.NEXT_PUBLIC_API_BASE}/upload`, {
-        method: "POST",
-        body: form,
-      });
-      if (!r.ok) throw new Error(await r.text());
-      setUploadFiles((prev) => prev.map(f => f.id === fileRec.id ? { ...f, status: "completed", progress: 100 } : f));
+      const form = new FormData();
+      form.append("file", fileRec.file);
+
+      // fetch doesn't expose upload progress; we fake a small ramp so users see movement
+      const ramp = setInterval(() => {
+        setUploadFiles((prev) =>
+          prev.map((f) =>
+            f.id === fileRec.id && f.status === "uploading"
+              ? { ...f, progress: Math.min(f.progress + 7, 85) }
+              : f
+          )
+        );
+      }, 150);
+
+      const resp = await fetch(`${API_BASE}/upload`, { method: "POST", body: form });
+      clearInterval(ramp);
+
+      if (!resp.ok) {
+        const msg = await resp.text().catch(() => "Upload failed");
+        throw new Error(msg);
+      }
+
+      // If your /upload already processes the PDF, you’re done.
+      // If it only saves the file, this scan will ingest it.
+      fetch(`${API_BASE}/ingest/scan`, { method: "POST" }).catch(() => {});
+
+      setUploadFiles((prev) =>
+        prev.map((f) =>
+          f.id === fileRec.id ? { ...f, status: "completed", progress: 100 } : f
+        )
+      );
     } catch (e) {
-      setUploadFiles((prev) => prev.map(f => f.id === fileRec.id ? { ...f, status: "error" } : f));
+      console.error(e);
+      setUploadFiles((prev) =>
+        prev.map((f) => (f.id === fileRec.id ? { ...f, status: "error" } : f))
+      );
     }
   };
 
@@ -131,7 +169,10 @@ export function UploadPage() {
               isDragOver ? "border-primary bg-primary/5" : "border-muted-foreground/25 hover:border-primary/50"
             }`}
             onDrop={handleDrop}
-            onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setIsDragOver(true);
+            }}
             onDragLeave={() => setIsDragOver(false)}
           >
             <Upload className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
@@ -146,7 +187,9 @@ export function UploadPage() {
               id="file-input"
             />
             <Button asChild>
-              <label htmlFor="file-input" className="cursor-pointer">Choose Files</label>
+              <label htmlFor="file-input" className="cursor-pointer">
+                Choose Files
+              </label>
             </Button>
             <p className="text-sm text-muted-foreground mt-4">Supported: PDF (max 10MB each)</p>
           </div>
@@ -163,11 +206,11 @@ export function UploadPage() {
           </CardHeader>
           <CardContent>
             <div className="space-y-4">
-              {uploadFiles.map((uploadFile) => (
-                <div key={uploadFile.id} className="flex items-center gap-4 p-4 border rounded-lg">
+              {uploadFiles.map((f) => (
+                <div key={f.id} className="flex items-center gap-4 p-4 border rounded-lg">
                   <div className="flex-shrink-0">
-                    {uploadFile.preview ? (
-                      <img src={uploadFile.preview} alt={uploadFile.file.name} className="w-16 h-16 object-cover rounded" />
+                    {f.preview ? (
+                      <img src={f.preview} alt={f.file.name} className="w-16 h-16 object-cover rounded" />
                     ) : (
                       <div className="w-16 h-16 bg-muted rounded flex items-center justify-center">
                         <ImageIcon className="h-6 w-6 text-muted-foreground" />
@@ -176,16 +219,16 @@ export function UploadPage() {
                   </div>
 
                   <div className="flex-1 min-w-0">
-                    <p className="font-medium truncate">{uploadFile.file.name}</p>
+                    <p className="font-medium truncate">{f.file.name}</p>
                     <p className="text-sm text-muted-foreground">
-                      {(uploadFile.file.size / 1024 / 1024).toFixed(2)} MB
+                      {(f.file.size / 1024 / 1024).toFixed(2)} MB
                     </p>
 
-                    {uploadFile.status === "uploading" && (
+                    {f.status === "uploading" && (
                       <div className="mt-2">
-                        <Progress value={uploadFile.progress} className="h-2" />
+                        <Progress value={f.progress} className="h-2" />
                         <p className="text-xs text-muted-foreground mt-1">
-                          {Math.round(uploadFile.progress)}% uploaded
+                          {Math.round(f.progress)}% uploaded
                         </p>
                       </div>
                     )}
@@ -194,23 +237,25 @@ export function UploadPage() {
                   <div className="flex items-center gap-2">
                     <Badge
                       variant={
-                        uploadFile.status === "completed"
+                        f.status === "completed"
                           ? "default"
-                          : uploadFile.status === "uploading"
+                          : f.status === "uploading"
                           ? "secondary"
-                          : uploadFile.status === "error"
+                          : f.status === "error"
                           ? "destructive"
                           : "secondary"
                       }
                     >
-                      {uploadFile.status}
+                      {f.status}
                     </Badge>
 
-                    {uploadFile.status === "pending" && (
-                      <Button size="sm" onClick={() => uploadOne(uploadFile)}>Upload</Button>
+                    {f.status === "pending" && (
+                      <Button size="sm" onClick={() => uploadOne(f)}>
+                        Upload
+                      </Button>
                     )}
 
-                    <Button size="sm" variant="ghost" onClick={() => removeFile(uploadFile.id)}>
+                    <Button size="sm" variant="ghost" onClick={() => removeFile(f.id)}>
                       <X className="h-4 w-4" />
                     </Button>
                   </div>
