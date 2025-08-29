@@ -4,14 +4,20 @@ import io
 import os
 from pathlib import Path
 from typing import Iterable, Tuple
+from pgvector.sqlalchemy import Vector   # <-- add this import
 
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Body
+from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from PIL import Image
-
+from sqlalchemy import text, bindparam, Integer
+from fastapi import UploadFile, File
+from pathlib import Path
 from db import init_db, session_scope, upsert_image_page
+from fastapi.middleware.cors import CORSMiddleware
+
 
 load_dotenv()  # loads .env in backend/
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -21,6 +27,18 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 app = FastAPI(title="IMG Searcher Backend")
+
+# Allow your Next.js dev server to call the API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ---------- Helpers ----------
 
@@ -32,12 +50,9 @@ def file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 def render_pdf_pages(pdf_path: Path, dpi: int = 150) -> Iterable[Tuple[int, bytes, Tuple[int, int]]]:
-    """
-    Yields (page_number, png_bytes, (width,height)) for each page.
-    """
     doc = fitz.open(pdf_path)
     for i, page in enumerate(doc, start=1):
-        mat = fitz.Matrix(dpi/72, dpi/72)  # scale
+        mat = fitz.Matrix(dpi / 72, dpi / 72)
         pix = page.get_pixmap(matrix=mat, alpha=False)
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         buf = io.BytesIO()
@@ -49,9 +64,6 @@ def png_bytes_to_data_url(png_bytes: bytes) -> str:
     return f"data:image/png;base64,{b64}"
 
 def call_openai_vision(png_bytes: bytes) -> dict:
-    """
-    Ask for structured JSON describing the image.
-    """
     data_url = png_bytes_to_data_url(png_bytes)
     SYSTEM = "You are an image metadata extractor. Return concise JSON only."
     USER = (
@@ -94,14 +106,7 @@ def build_text_for_embedding(meta: dict, fallback_filename: str) -> str:
     colors = meta.get("colors") or []
     eyewear = "eyewear_present" if meta.get("is_eyewear_present") else ""
     return "\n".join(
-        [
-            fallback_filename,
-            caption,
-            " ".join(keywords),
-            " ".join(objects),
-            " ".join(colors),
-            eyewear,
-        ]
+        [fallback_filename, caption, " ".join(keywords), " ".join(objects), " ".join(colors), eyewear]
     ).strip()
 
 # ---------- Core pipeline ----------
@@ -113,7 +118,6 @@ def process_pdf(pdf_path: Path, web_path_for_ui: str | None = None):
 
     for page_number, png_bytes, (w, h) in render_pdf_pages(pdf_path):
         meta = call_openai_vision(png_bytes)
-
         text_for_embedding = build_text_for_embedding(meta, fallback_filename=pdf_filename)
         vector = embed_text(text_for_embedding)
 
@@ -136,36 +140,67 @@ def process_pdf(pdf_path: Path, web_path_for_ui: str | None = None):
         print(f"✓ Stored {pdf_filename} page {page_number}")
 
 # ---------- API ----------
+SAMPLES_DIR = (Path(__file__).resolve().parents[1] / "frontend" / "public" / "samples")
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    # save into Next.js public/samples so the browser can reach it at /samples/<name>
+    SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+    target = SAMPLES_DIR / file.filename
+    with target.open("wb") as f:
+        f.write(await file.read())
 
+    # run your existing pipeline (renders page 1, hits OpenAI, stores to Postgres)
+    process_pdf(target, web_path_for_ui=f"/samples/{file.filename}")
+
+    return {"ok": True, "file": file.filename, "web_path": f"/samples/{file.filename}"}
 @app.get("/health")
 def health():
     return {"ok": True}
 
 @app.post("/ingest/local")
 def ingest_local(folder: str = "../frontend/public/samples"):
-    """
-    Process all PDFs in a local folder (default points to your dev samples).
-    """
     folder_path = Path(folder).resolve()
     if not folder_path.exists():
         return {"ok": False, "error": f"Folder not found: {folder_path}"}
-
     pdfs = sorted(folder_path.glob("*.pdf"))
     if not pdfs:
         return {"ok": False, "error": f"No PDFs in {folder_path}"}
-
     for pdf in pdfs:
-        # When serving via Next.js public/, this web path works in your UI
         web_path = f"/samples/{pdf.name}"
         process_pdf(pdf, web_path_for_ui=web_path)
-
     return {"ok": True, "processed": len(pdfs)}
 
+@app.post("/search")
+def search(q: str = Body(embed=True), k: int = 24):
+    q = (q or "").strip()
+    if not q:
+        return {"ok": True, "results": []}
+
+    # 1) Embed the query
+    vec = client.embeddings.create(
+        model="text-embedding-3-large", input=q
+    ).data[0].embedding
+
+    # 2) SQL with typed bind params (so :query_vec is a pgvector)
+    sql = text("""
+        SELECT id, pdf_filename, page_number, caption, keywords, pdf_path,
+               1 - (embedding <=> :query_vec) AS score
+        FROM image_pages
+        ORDER BY embedding <=> :query_vec
+        LIMIT :k
+    """).bindparams(
+        bindparam("query_vec", type_=Vector(3072)),
+        bindparam("k", type_=Integer),
+    )
+
+    with session_scope() as s:
+        rows = s.execute(sql, {"query_vec": vec, "k": k}).mappings().all()
+
+    return {"ok": True, "results": [dict(r) for r in rows]}
 # ---------- CLI ----------
 
 if __name__ == "__main__":
     init_db()
-    # Run as a one-off to ingest your dev PDFs:
     samples = Path(__file__).resolve().parents[1] / "frontend" / "public" / "samples"
     print(f"Ingesting from: {samples}")
     for p in sorted(samples.glob("*.pdf")):
